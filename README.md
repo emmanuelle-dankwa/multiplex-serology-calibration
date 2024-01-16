@@ -19,7 +19,7 @@ Analyses was run in R version 4.0.5. Package versions and references are provide
  
 * `results`: contains the outputs of `analysis.Rmd`. Figures are separately stored in the subfolder `figs`.
   
-* `monbart_0.3`: R package to run the monotone BART algorithm, based on the C++ implementation by , available at [https://bitbucket.org/remcc/mbart/src/master/](https://bitbucket.org/remcc/mbart/src/master/). We created a 
+* `monbart_0.3`: R package to run the monotone BART algorithm, based on the C++ implementation by Chipman et al. (2022), available at [https://bitbucket.org/remcc/mbart/src/master/](https://bitbucket.org/remcc/mbart/src/master/). We created a 
 custom R interface to the C++ code for the purposes of this study.
 
 
@@ -33,5 +33,9 @@ custom R interface to the C++ code for the purposes of this study.
 # Questions 
 
 Please contact Emmanuelle at [edankwa@hsph.harvard.edu](edankwa@hsph.harvard.edu). 
+
+# Reference
+
+Hugh A. Chipman. Edward I. George. Robert E. McCulloch. Thomas S. Shively. "mBART: Multidimensional Monotone BART." Bayesian Anal. 17 (2) 515 - 544, June 2022.
 
 
