@@ -1,0 +1,5 @@
+useDynLib(monbart, .registration=TRUE)
+importFrom(Rcpp, evalCpp)
+importFrom(parallel, makeCluster, clusterCall, clusterEvalQ, stopCluster)
+importFrom(stats, lm, sd, qchisq)
+export(pmonbart, monbart, rpmonbart)
