@@ -5,7 +5,7 @@ The R code in this repository reproduces the results in the paper:
 Emmanuelle A. Dankwa, Martyn Plummer, Daniel Chapman, Rima Jeske, Julia Butt,
 Michael Hill, Tim Waterboer, Iona Y. Millwood, Ling Yang, and Christiana Kartsonaki. Calibrating multiplex serology for *Helicobacter pylori*.
 
-Analyses was run in R version 4.0.5. Package versions and references are provided in manuscript.
+Analyses were run in R version 4.0.5. Package versions and references are provided in manuscript.
 
 # Components and description 
 
