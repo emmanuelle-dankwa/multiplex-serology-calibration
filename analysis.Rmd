@@ -1,0 +1,1172 @@
+---
+title: "Calibration of multiplex serology"
+author: "Emmanuelle A. Dankwa"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+   html_document:
+    number_sections: yes
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load packages 
+
+library(MLmetrics)    # Log loss function
+library(pROC)         # AUC
+library(DescTools)     # Brier score function
+library(glmnet)       # General linear models
+library(bartMachine)  # Bart machine
+library(randomForest) # Random forest
+library(caret)      # Model Training (machine learning)
+library(psych)     # classification repertoire
+library(plyr)      # Data wrangling 
+library(monbart) # Assumes that monbart has already been installed. See README for installation instructions. 
+library(dplyr)     # Data wrangling 
+library(here)      # Dorectory navigation
+library(yardstick) # ROC Curves and AUC computation 
+
+```
+
+
+
+# Load data 
+
+Load standardized and scaled data.
+
+```{r}
+s <- readRDS(file = here::here("data", "dummy-data", "training-data.RDS"))
+
+```
+
+
+# Classification analysis 
+
+* State that there were no missing data among responses in the analysis set. 
+
+## Actions
+
+1. Load training (N=498) and test (N=922) data sets. 
+
+2. For all models, perform 10-fold CV, with fixed folds, to allow comparison of model predictive performance scores, summarized as mean +- SD of CV predictive performance scores across the 10 folds. 
+
+(Question of interest: which model predicts best?)
+
+3. Train each model on training data, with flexible folds, to allow i) selection of best hyperparameter value/ combination on the training data as a whole, and ii) assessment of variable importance. 
+
+(Questions of interest: i) for a given model, which hyperparameter value/combination predicts best?, and ii) which variables are important for prediction, and to what extent do models agree on variable importance?). 
+
+4. With the best hyperparameter combination for each model (in 3), predict on the test set (not used for training) and compare prediction performance. 
+
+(Question of interest: how well do the calibrated models fare with an out-of-sample set?)
+
+### Details 
+
+We consider four classification methods:
+* Logistic regression (without regularization)
+* Ridge regression
+* Lasso regression
+* Random forest
+* BART 
+* mBART
+
+ Model predictive performance is based on the following scores: 
+
+* Brier score
+* Log loss 
+* Area under the curve (AUC) 
+
+## Stage 1: Compare classification methods based on predictive performance
+
+### Split data into 10 folds
+
+```{r define-folds, eval=FALSE}
+# Set seed for reproducibility
+set.seed(1432)
+
+# Create ten folds 
+folds10 <- caret::createFolds(y = c(1:dim(s)[1]), k = 10)
+
+# Save partition indices
+# saveRDS(folds10, file = here::here("data", "dummy-data", "folds10.RDS"))
+```
+
+
+```{r load-data-2}
+
+#folds10 <- readRDS(file = here::here("data", "dummy-data", "folds10.RDS")) # Cross-validation folds (see chunk `define-fold` above)
+```
+
+
+
+### Perform cross-validation on models
+
+Notes: 
+
+1. All logistic regression models include all possible two-way interaction terms.
+
+2. All functions for the methods have three arguments: `folds`, for the cross-validation folds; `df`, for the data; and `k`, for the number of folds used in any one iteration ($k=10$; 9 folds for training, 1 fold for testing).  
+
+3. For all models except standard logistic regression , hyperparameter tuning is performed at the training set. 
+
+4. For hyperparameter tuning, we use five-fold cross validation. The value of $k$ is reduced due to the smaller sizes of folds compared to the data set.
+
+
+
+
+####  Logistic regression 
+
+```{r log-reg, eval=FALSE}
+
+# Description: This wrapper function performs 10-fold cross validation with the non-regularized 
+# logistic regression model and records the log_score, Brier score and the AUC at each iteration, as well as the averages of these quantities across iterations.
+
+#Arguments:
+
+#folds = list of fold indices 
+# df = data
+# k =  number of folds for cross validation 
+wrap.log <- function(folds=folds10, df= s, k=10) {
+  
+  #Allocate data frame for storage of performance values
+  
+  dfl <- data.frame(log_scores =numeric(k), 
+                    Brier_scores=numeric(k), 
+                    AUCs = numeric(k))
+  for (i in 1:k){
+    #For each iteration,
+    ############ Define train and test sets #################
+    
+    #Define test set  
+    test <- df[folds[[i]],  ]
+    
+    #Define training set
+    train <- df[unlist(folds[-i], use.names= FALSE), ]
+    
+    ############ Train  ##################
+    # Calibrate ith model, allow internal CV
+    logistic_i <- stats::glm(helicoblot_ckb_overall ~ ., 
+                             data = train, 
+                             family = binomial()) 
+    
+    
+    ############ Test ##################
+    # Predict on test set
+    predicted.values <- predict(logistic_i, newdata= test[,-1], type='response')
+    
+    ############ Test and record performance results #################
+    
+    # Evaluate performance on test set
+    
+    dfl$log_scores[i] <- MLmetrics::LogLoss(predicted.values, as.numeric(as.character(test[,1])))
+    dfl$Brier_scores[i] <- DescTools::BrierScore(x = as.numeric(as.character(test[, 1])), pred = predicted.values)
+    dfl$AUCs[i] <- pROC::roc(test[, 1], predicted.values, quiet = TRUE)$auc
+    
+  }
+  return(dfl) 
+}
+
+```
+
+
+#### Elastic net 
+
+Here, we define two functions for two different settings: 
+
+1. Elastic net model with a fixed mixing parameter $\alpha$ (fixed at 0.90)  -- the regularisation parameter $\lambda$ is tuned.
+
+2. Elastic net model in which both $\alpha$ and $\lambda$ are tuned.
+
+
+```{r elastic-net}
+
+# Elastic net model with a fixed $\alpha$
+
+wrap.log.enet1 <- function(folds=folds10, df= s, k=10) { # fixed alpha 
+  
+  # Allocate data frame for storage of performance values
+  
+  dfl <- data.frame(log_scores =numeric(k), 
+                    Brier_scores=numeric(k), 
+                    AUCs = numeric(k),
+                    lambda = numeric(k)) # regularization parameter
+
+  for (i in 1:k){
+    
+    ############ Define train and test sets #################
+    #For each iteration,
+    
+    # Define test set  
+    test <- df[folds[[i]],  ]
+    test_1 <- data.frame(model.matrix(helicoblot_ckb_overall ~ (.)^2, test))[, -1]
+    
+    #Define training set
+    
+    train <- df[unlist(folds[-i], use.names= FALSE), ]
+    train_1 <- data.frame(model.matrix(helicoblot_ckb_overall ~ (.)^2, train))[, -1]
+    
+    
+    ############ Train  #################
+    # Calibrate ith model, allow internal CV of lambda parameter
+    
+    
+    logistic_enet1 <-glmnet::cv.glmnet(x = as.matrix(train_1),
+                                       y = as.factor(train[,1]),
+                                       family = 'binomial', 
+                                       alpha=0.9, # More weight towards lasso but allowing for ridge regression to control multicollinearity effects
+                                       standardize = F,  # data already scaled
+                                       nfolds = 5)    # Number of folds for hyperparameter tuning
+    
+     ############ Test #################
+    # Predict on test set
+    predicted.values <- as.data.frame(predict(logistic_enet1, 
+                                              newx= as.matrix(test_1), 
+                                              type='response', 
+                                              s = 'lambda.min')[,1])[[1]] # Use best-fit value of lambda 
+
+    
+    ############ Test and record performance results #################
+    
+    # Evaluate performance on test set
+    
+    dfl$log_scores[i] <- MLmetrics::LogLoss(predicted.values, as.numeric(as.character(test[,1])))
+    dfl$Brier_scores[i] <- DescTools::BrierScore(x = as.numeric(as.character(test[, 1])), pred = predicted.values)
+    dfl$AUCs[i] <- pROC::roc(test[, 1], predicted.values, quiet = TRUE)$auc
+    dfl$lambda[i] <- logistic_enet1$lambda.min # Record hyperparameter value
+    
+    
+  }
+  return(dfl)
+}
+
+
+
+
+# Elastic net model with a variable alpha and lambda 
+
+wrap.log.enet2 = function(folds=folds10, df= s, k=10){
+  
+  
+  #Allocate data frame for storage of performance values
+  
+  dfl <- data.frame(log_scores =numeric(k), 
+                    Brier_scores=numeric(k), 
+                    AUCs = numeric(k),
+                    lambda = numeric(k),
+                    alpha = numeric(k)) 
+  
+  for (i in 1:k){
+    
+    ############ Define train and test sets #################
+    #For each iteration,
+    
+    # Define test set  
+    test <- df[folds[[i]],  ]
+    test_1 <- data.frame(model.matrix(helicoblot_ckb_overall ~ (.)^2, test))[, -1]  # Compute two-way interactions 
+    
+    # Define training set
+    
+    train <- df[unlist(folds[-i], use.names= FALSE), ]
+    train_1 <- data.frame(model.matrix(helicoblot_ckb_overall ~ (.)^2, train))[, -1] # Compute two-way interactions 
+    
+    
+    ############ Train  #################
+    # Calibrate ith model, allow internal CV of lambda parameter
+    
+    logistic_enet2 <- caret::train(x = as.matrix(train_1),
+                               y = as.factor(train[,1]),
+                               method = "glmnet" ,
+                               trControl = caret::trainControl("cv", number = 5))
+    
+    
+    # Predict on test set using best fit values for alpha and lambda
+    
+    predicted.values <- predict(logistic_enet2, 
+                                newdata= as.matrix(test_1), 
+                                type='prob')[,"1"]# Use best-fit value of lambda 
+    
+    
+    ############ Test and record performance results #################
+    
+    # Evaluate performance on test set
+    dfl$log_scores[i] <- MLmetrics::LogLoss(predicted.values, as.numeric(as.character(test[,1])))
+    dfl$Brier_scores[i] <- DescTools::BrierScore(x = as.numeric(as.character(test[, 1])), pred = predicted.values)
+    dfl$AUCs[i] <- pROC::roc(test[, 1], predicted.values, quiet = TRUE)$auc
+    # Record best hyperparameter values (the combination which produced the highest accuracy among other  
+    # parameter combinations)
+    dfl$lambda[i] <- logistic_enet2$bestTune$lambda
+    dfl$alpha[i] <- logistic_enet2$bestTune$alpha
+    
+  }
+  return(dfl)
+}
+
+```
+
+
+
+#### BART
+
+
+```{r bart, eval=FALSE}
+
+wrap.bart <- function(folds=folds10, df=s, k= 10) {
+  
+  #Allocate data frame for storage of performance values
+  
+  dfl <- data.frame(log_scores =numeric(k), 
+                    Brier_scores=numeric(k), 
+                    AUCs = numeric(k),
+                    k = numeric(k), 
+                    m = numeric(k))
+  
+  for (i in 1:k){
+    print(i) # For monitoring, since BART is relatively slower 
+    
+    ############ Define train and test sets #################
+    #For each iteration,
+    
+    #Define test set  
+    test <- df[folds[[i]],  ]
+    
+    #Define training set
+    
+    train <- df[unlist(folds[-i], use.names= FALSE), ]
+    
+    
+    ############ Train  #################
+    # Calibrate ith model, allow internal CV
+    
+    bm_cv_10 <- bartMachine::bartMachineCV(X = train[ ,-1], 
+                                           y = train[,1],
+                                           verbose=FALSE,
+                                           k_folds = 5) 
+
+    ############ Test #################
+    predicted.values <- predict(bm_cv_10, test[,-1], type='prob')
+    
+    # Evaluate performance on test set
+    dfl$log_scores[i] <- LogLoss(y_pred = 1- predicted.values, y_true = as.numeric(as.character(test[,1])))
+    dfl$Brier_scores[i] <- BrierScore(x = as.numeric(as.character(test[, 1])), pred = 1 - predicted.values)
+    dfl$AUCs[i] <- roc(test[, 1], predicted.values)$auc
+    dfl$k[i] <-  bm_cv_10$k
+    dfl$m[i] <-  bm_cv_10$num_trees
+  }
+  return(dfl)
+}
+
+```
+
+
+
+#### Random Forest 
+
+```{r random-forest, eval=FALSE}
+
+wrap.rf <- function(folds=folds10, df= s, k=10){
+  
+   # Data frame for storage of performance values
+  
+  dfl <- data.frame(log_scores =numeric(k), 
+                    Brier_scores=numeric(k), 
+                    AUCs = numeric(k),
+                    mtry = numeric(k))
+  
+  for (i in 1:k){
+    
+    ############ Define train and test sets #################
+    #For each iteration,
+    
+    #Define test set  
+    test <- df[folds[[i]],  ]
+    
+    #Define training set
+    
+    train <- df[unlist(folds[-i], use.names= FALSE), ]
+    
+    
+    
+    ############ Train  #################
+    # Calibrate ith model, allow internal CV
+    
+    rf <- caret::train(train[ ,-1], 
+                       train[,1], 
+                       method = "rf",
+                       trControl = trainControl("cv", number = 5)) # to fix folds for cross-validation, add 'index = folds[-i]'
+    
+    ############ Test #################
+    # Predict on test set
+    predicted.values <- predict(rf$finalModel, test[ ,-1], type='prob')
+    
+    ############ Test and record performance results ##############
+    
+    dfl$log_scores[i] <- LogLoss(predicted.values[,2], as.numeric(as.character(test[,1])))
+    dfl$Brier_scores[i] <- BrierScore(x = as.numeric(as.character(test[, 1])), pred =predicted.values[,2])
+    dfl$AUCs[i] <- roc(test[, 1], predicted.values[,2])$auc
+    dfl$mtry[i] <-  rf$finalModel$mtry
+  }
+  
+  return(dfl)
+}
+
+```
+
+
+#### mBART 
+
+```{r mbart, eval=FALSE}
+wrap.mbart = function(folds=folds10, df= s, k=10) {
+  
+  
+  dfl <- data.frame(log_scores =numeric(k), 
+                    Brier_scores=numeric(k), 
+                    AUCs = numeric(k))
+  #  classif_errors = numeric(k))
+  
+  for (i in 1:k){
+    
+    ############ Define train and test sets #################
+    #For each iteration,
+    
+    #Define test set  
+    test <- df[folds[[i]],  ]
+    
+    #Define training set
+    
+    train <- df[unlist(folds[-i], use.names= FALSE), ]
+    
+    ############ Train  #################
+    # Calibrate ith model, allow internal CV
+    
+    monbartkntree <- caret::train(x = train[ ,-1], 
+                                  y =  train[,1], 
+                                  method = mbart,
+                                  trControl = caret::trainControl(method = "cv", number = 5)
+    )
+    
+    
+    ############ Test #################
+    predicted.values <- extractProb(models = list(monbartkntree), unkX = test[,-1])$classProb
+    
+    
+    ############ Test and record performance results #################
+    
+    
+    # Evaluate performance on test set
+    dfl$log_scores[i] <-  MLmetrics::LogLoss(y_pred = predicted.values , y_true = as.numeric(as.character(test[,1])))
+    dfl$Brier_scores[i] <- DescTools::BrierScore(x = as.numeric(as.character(test[, 1])), pred =  predicted.values )
+    dfl$AUCs[i] <- pROC::roc(test[, 1], predicted.values)$auc
+    
+  }
+  
+  dfl
+}
+```
+
+
+
+### Performance estimates (based on 10-fold cross validation)
+
+Compute performance estimates.
+
+Note that the chunk below is computationally intensive. Run on a cluster if possible. 
+
+```{r performance-estimates, eval = F}
+
+#### Call functions ####
+
+log <- wrap.log()       # Logistic regression (only main effects)
+log_ridge <- wrap.log.ridge()  # Ridge regression, alpha = 0
+log_lasso <- wrap.log.lasso()  # Lasso regression, alpha = 1
+log_enet1 <- wrap.log.enet1()  # E. net, alpha fixed
+log_enet2 <- wrap.log.enet2()  # E.net, alpha and lambda variable 
+options(java.parameters = "-Xmx5g") # Make more space for bart_machine
+bart_rep <- wrap.bart()             # BART
+rf_rep <- wrap.rf()                 # Random forest
+mbart_rep <- wrap.mbart()           # mBART; see here::here("server", "mbart_cv_train_on_analysis_set.R")
+
+# Combine results into a listcompl
+all_results <- list(Logistic_regression = log, 
+                    Ridge_regression = log_ridge, 
+                    Lasso_regression = log_lasso,
+                    Elastic_net_fixed_alpha = log_enet1,
+                    Elastic_net = log_enet2,
+                    BART = bart_rep,
+                    Random_forest = rf_rep,
+                    mBART = mbart_rep)
+
+# Save results
+saveRDS(all_results, file = here::here("results", "all_results.RDS"))
+
+# Miscellaneous function for computing summaries
+summary.function <-  function(l = estims_list){
+
+# Create data frame to store estimates 
+df <- as.data.frame(matrix(NA, 
+                           nrow= length(l), 
+                           ncol = 3*2,
+                           dimnames = list(row_names = names(l), 
+                                           col_names = c("mean_log_score",
+                                                         "mean_Brier_score",
+                                                         "mean_AUC",
+                                                         "sd_log_score",
+                                                         "sd_Brier_score",
+                                                         "sd_AUC"))))
+# Compute summaries
+
+for(i in 1:(ncol(df)/2)){
+  df[, i] <- unlist(lapply(l, function(x){mean(x[,i])}))
+  df[, i+3] <- unlist(lapply(l, function(x){sd(x[,i])}))
+}
+df
+
+}
+```
+
+
+```{r performance-estimates-2, eval=FALSE}
+# Compute performance score summaries
+all_results_summaries <- summary.function(l=all_results)
+#saveRDS(all_results_summaries, file = here::here("results", "all_results_summaries.RDS"))
+```
+
+
+Show results.
+
+```{r performance-estimates-3}
+# Compute performance score summaries
+#all_results_summaries <- readRDS(file = here::here("results", "all_results_summaries.RDS"))
+#all_results_summaries
+write.csv(all_results_summaries[-c(2,3,5), ], file =  here::here("results", "all_results_reported.csv")) 
+```
+
+
+
+
+## Stage 1b.: Select best hyperpaprameter values on training set
+
+In this section, we build models on the training set, allowing for flexible (not fixed) folds. This will enable us determine i) the best hyperparameter value/combination for each model on the training data, and ii) variable importance. For all models, we set the number of folds for internal cross-validation to $k=10$.  
+
+### Train 
+
+#### BART
+
+```{r bart-prediction-model, eval=F}
+# Build BART model
+bm_cv_10 <- bartMachineCV(s[,-1], 
+                       s[,1],
+                       k_folds = 10,
+                       serialize = TRUE) # Set serialize to TRUE to enable persistence in future R sessions
+
+# Save prediction model
+save(bm_cv_10, file = here::here("results", "bm_cv_10.rda"))
+```
+
+##### Cross-validation results 
+
+Cross-validation results: 
+
+```{r bart-cv-results}
+#load(here::here("results", "bm_cv_10.rda"))  # Load results
+bm_cv_10$cv_stats
+```
+
+
+Best model: $k=2$, $num_trees=200$.
+
+
+
+#### Random forest 
+
+```{r rf-prediction-model, eval=F}
+
+set.seed(1432) 
+rf_cv_10 <- caret::train(x = s[ ,-1], 
+                         y =  s[,1], 
+                         method = "rf",
+                         trControl = caret::trainControl("cv", number = 10),
+                         importance = TRUE,
+                          tuneGrid = data.frame(.mtry=seq(1, 12, by=1)),
+                         )
+
+# Save prediction model
+#save(rf_cv_10, file = here::here("results", "rf_cv_10.rda"))
+write.csv(rf_cv_10$results, file = here::here("results", "rf_cv_10.csv") )
+# Function `train` on page 163 of caret package manual. May 15, 2021 version
+```
+
+
+##### Cross-validation results 
+
+```{r rf-cv-results}
+#load(here::here("results", "rf_cv_10.rda")) # Load results
+rf_cv_10$results
+```
+
+Best hyperparameter value:
+
+```{r rf-best-model}
+rf_cv_10$finalModel
+```
+
+#### Logistic regression 
+
+```{r logistic-regression}
+log_no_cv<-  stats::glm(helicoblot_ckb_overall ~ ., 
+                             data = s, 
+                             family = binomial()) 
+save(log_no_cv, file=here::here("results", "log_no_cv.rda")) 
+```
+
+
+
+
+#### Elastic net 
+
+```{r elastic-net, eval=F}
+# Cross validate to choose lambda
+s_1 <- data.frame(model.matrix(helicoblot_ckb_overall ~ (.)^2, s))[, -1]
+enet_cv_10 <- glmnet::cv.glmnet(x= as.matrix(s_1), 
+                      y=as.factor(s[,1]),
+                      family = 'binomial', 
+                      alpha=0.9,           
+                      standardize = F,   
+                      nfolds = 10, 
+                      type.measure= "class") 
+
+
+
+# Save model
+save(enet_cv_10, file=here::here("results", "enet_cv_10.rda")) 
+```
+
+##### Cross-validation results
+
+Model: 
+
+```{r enet-cv-10, eval = F}
+#load(file=here::here("results", "enet_cv_10.rda"))
+plot(enet_cv_10)
+axis(side=3,at=10,labels="",tick=FALSE,line=0, ylab = "a")
+# Dotted lines show minimum value of lambda and 1se of lambda 
+
+png(filename = here::here("results", "figs", "enet_cv_results.png"), 
+    res = 300, 
+    height = 6, 
+    width = 8,
+    units = "in"
+    )
+plot(enet_cv_10)
+dev.off()
+
+```
+
+
+#### mBART 
+
+```{r mbart-train, eval=F}
+# Cross validate to choose lambda
+mbart_no_cv <- monbart::pmonbart(x.train = s[, -1], 
+                                       y.train= as.numeric(as.character(s[,1])), 
+                                       x.test = s[,-1],
+                                       nskip = 250) 
+
+# Save model
+save(mbart_no_cv, file=here::here("results", "mbart_no_cv.rda"))
+
+```
+
+
+
+
+
+## Stage 2: Predict on case (test) data
+
+Load the standardized test data on a log scale. 
+
+```{r case-data-2, eval=FALSE}
+# Complete test set 
+external <- readRDS(file = here::here("data", "dummy-data", "test-data.RDS"))
+
+```
+
+Then predict on the test data using the models trained at Stage 1b. 
+
+### BART 
+
+```{r bart-predict}
+
+### TOTAL ### 
+predicted.values.bm <- predict(bm_cv_10, external[,-1], type='prob')
+    
+# Evaluate performance on test set
+log_score <- MLmetrics::LogLoss(y_pred = 1- predicted.values.bm, y_true = as.numeric(as.character(external[,1])))
+brier_score <- DescTools::BrierScore(x = as.numeric(as.character(external[, 1])), pred = 1 - predicted.values.bm)
+auc_bm <- pROC::roc(as.numeric(as.character(external[, 1])), predicted.values.bm, quiet = TRUE)$auc[[1]]
+
+results_bart <- list(brier_score,
+                     log_score,
+                     auc_bm)
+results_bart
+
+```
+
+
+
+
+
+### Random forest 
+
+```{r rf-predict}
+
+### TOTAL ###
+
+# Predict on external set
+predicted.values.rf <- predict(rf_cv_10$finalModel, external[ ,-1], type='prob')
+
+############ Test and record performance results ##############
+
+log_score_rf <- MLmetrics::LogLoss(predicted.values.rf[,2], as.numeric(as.character(external[,1])))
+brier_score_rf <- DescTools::BrierScore(x = as.numeric(as.character(external[, 1])), pred =predicted.values.rf[,2])
+auc_rf <- pROC::roc(as.numeric(as.character(external[, 1])), predicted.values.rf[,2], quiet = TRUE)$auc[[1]]
+
+results_rf <- list(brier_score_rf,
+                   log_score_rf,
+                   auc_rf)
+
+results_rf
+```
+
+
+
+
+### Elastic net 
+
+```{r rf-predict}
+
+# Predict on test set
+external_1 <- data.frame(model.matrix(helicoblot_ckb_overall ~ (.)^2, external))[, -1]  # Compute
+
+### TOTAL ###
+
+predicted.values.enet <- as.data.frame(predict(enet_cv_10, 
+                                              newx= as.matrix(external_1), 
+                                              type='response', 
+                                              s = 'lambda.min')[,1])[[1]] # Use best-fit value of lambda 
+
+log_score_enet <- MLmetrics::LogLoss(predicted.values.enet, as.numeric(as.character(external[,1])))
+brier_score_enet <- DescTools::BrierScore(x = as.numeric(as.character(external[, 1])), pred = predicted.values.enet)
+auc_enet <- pROC::roc(as.numeric(as.character(external[, 1])), predicted.values.enet, quiet = TRUE)$auc[[1]]
+
+results_enet <- list( brier_score_enet,
+                      log_score_enet,
+                      auc_enet)
+
+results_enet
+
+```
+
+### Logistic regression 
+
+
+```{r lr-predict}
+
+#### TOTAL ####
+
+# Predict on external set
+predicted.values.lr <- predict(log_no_cv, newdata= external[,-1], type='response')
+
+############ Test and record performance results ##############
+
+log_score_lr <- MLmetrics::LogLoss(predicted.values.lr, as.numeric(as.character(external[,1])))
+brier_score_lr <- DescTools::BrierScore(x = as.numeric(as.character(external[, 1])), pred =predicted.values.lr)
+auc_lr <- pROC::roc(external[, 1], predicted.values.lr, quiet = TRUE)$auc[[1]]
+
+results_lr<- list(brier_score_lr,
+                   log_score_lr,
+                  auc_lr )
+
+results_lr
+```
+
+
+### mBART 
+
+```{r mbart-predict}
+### TOTAL ###
+
+# Predict on external set. Responses already in model object 
+
+predicted.values.mbart <- caret::extractProb(models = list(mbart_cv_10), unkX = external[,-1])$classProb
+saveRDS(predicted.values.mbart, here::here("results", "mbart", "predicted.values.mbart.RDS"))
+
+
+log_score_mb <-  MLmetrics::LogLoss(y_pred = predicted.values.mbart , y_true = as.numeric(as.character(external[,1])))
+brier_score_mb  <- DescTools::BrierScore(x = as.numeric(as.character(external[, 1])), pred =  predicted.values.mbart)
+auc_mb <- pROC::roc(as.numeric(as.character(external[, 1])), predicted.values.mbart, quiet = TRUE)$auc[[1]]
+
+
+############ Test and record performance results ##############
+
+results_mb<- list(brier_score_mb,
+                   log_score_mb,
+                  auc_mb)
+
+results_mb
+
+```
+
+
+Combine prediction results on test data. 
+
+```{r combine-results, eval = FALSE}
+
+scores_on_test_data <- list( Logistic_regression = results_lr,
+                        Elastic_net = results_enet,
+                      BART = results_bart,
+                       RF = results_rf,
+                       mBART = results_mb)
+
+scores_on_test_data
+
+# Save scores on test data
+save(scores_on_test_data, file = here::here("results", "scores_on_test_data.rda"))
+
+
+# Organise 
+
+df_scores_test_data  <- data.frame(matrix(unlist(scores_on_test_data), ncol = 3, byrow = TRUE))
+colnames(df_scores_test_data) <- c("Brier score", "Log loss", "AUC")
+rownames(df_scores_test_data) <- c("LR",
+                         "Enet",
+                         "BART",
+                         "RF",
+                         "mBART"
+)
+
+write.csv(df_scores_test_data, file = here::here("results", "df_scores_test_data.csv"))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Stage 3: Variable importance 
+
+
+#### BART
+
+We rank variable importance based on variable inclusion proportions: the proportion of times that predictor is used in node splitting rules (see references in manuscript). To improve stability of the estimates, the final importance value for a predictor is computed as the average of estimates from 5 replications of the model. 
+
+ 
+```{r bartvar-imp, eval=FALSE}
+var_imp <- investigate_var_importance(bm_cv_10, 
+                                      num_replicates_for_avg = 100, 
+                                      type = "splits")  # Included in bart.rda object,
+                                                        # Chipman et al. 2010. 
+saveRDS(var_imp, file = here::here("results", "var_imp.RDS"))
+```
+
+Organize results in a data frame. 
+
+```{r var-imp-bart-2}
+# Create data frame of estimates
+bm_df <- data.frame(preds = names(var_imp$avg_var_props),
+                    inclusion_props = var_imp$avg_var_props,
+                    sd = var_imp$sd_var_props,
+                    moe = 1.96*(var_imp$sd_var_props)/sqrt(5) )#  margin of error (where 5 is the number of replicates);
+row.names(bm_df) <- NULL
+
+
+# Update to rename "Omp" to "HP1564" as latter is more specific: 21/06/2022
+# Result of reviews by Heidelberg multiplex serology group
+
+bm_df$preds[which(bm_df$preds=="Omp")] <- "HP1564"
+  
+
+# Factor levels in decreasing order 
+bm_df$preds <- factor(bm_df$preds, 
+                      level = bm_df$preds[order(bm_df$inclusion_props, decreasing=TRUE)])
+
+```
+
+BART variable importance plot. 
+
+```{r var-imp-bart-3}
+
+# Plot 
+bart_var_imp_plot_100 <- ggplot(bm_df, aes(x = preds, y = inclusion_props)) +
+  geom_bar(stat = "identity") +
+  theme_bw() + 
+  labs(x = "Predictors (antigens)",
+       y = "Inclusion proportion",
+       title = "") +                            # Variable importance - BART
+  geom_errorbar(aes(ymin = inclusion_props-sd,
+                    ymax = inclusion_props+sd,
+                width = 0.2)) + 
+  theme(axis.title = element_text(size=14), axis.text= element_text(size=12))
+# dev.off()
+
+bart_var_imp_plot_100
+
+```
+
+
+The plot gives the average variable inclusion proportions for each variable and the standard error for the mean. 
+
+
+
+#### Random forest 
+
+Variable importance measure: mean decrease in accuracy. 
+
+How is the mean decrease in accuracy computed? 
+
+1. For each tree, 
+
+a. Compute the prediction accuracy on the out-of-bag (OOB) portion of the data. 
+
+b. Permute each predictor variable on the OOB and record the prediction accuracy. 
+
+c. Compute the differences between the accuracy obtained in a. and b. 
+
+2. For each predictor variable, compute the average and standard deviation of the differences in prediction accuracy over all trees. 
+
+
+*RFs offer an additional method for computing variable importance scores. The idea
+is to use the leftover out-of-bag (OOB) data to construct validation-set errors for each tree.
+Then, each predictor is randomly shuffled in the OOB data and the error is computed
+again. The idea is that if variable x is important, then the validation error will go up when
+x is perturbed in the OOB data. The difference in the two errors is recorded for the OOB
+data then averaged across all trees in the forest.
+
+```{r var-imp-rf}
+cat("Mean decrease in acccuracy")
+rf_cv_10$finalModel$importance[, 3]
+```
+
+```{r var-imp-rf-2}
+cat("Standard deviations")
+rf_cv_10$finalModel$importanceSD[, 3]
+```
+
+Plot 
+
+```{r var-imp-rf-3}
+# Create data frame of estimates 
+rf_df2 <- data.frame(preds = rownames(rf_cv_10$finalModel$importance),
+                    mean_decrease_in_accuracy = rf_cv_10$finalModel$importance[,3],
+                    sd =  rf_cv_10$finalModel$importanceSD[,3],
+                    moe = 1.96*(rf_cv_10$finalModel$importanceSD[,3]/sqrt(500))) # Margin of error; 500 is the number of trees. Each tree yields an estimate 
+row.names(rf_df2) <- NULL
+
+# Update to rename "Omp" to "HP1564" as latter is more specific: 21/06/2022
+# Result of reviews by Heidelberg multiplex serology group
+
+rf_df2$preds[which(rf_df2$preds=="Omp")] <- "HP1564"
+
+
+# Factor levels in decreasing order 
+rf_df2$preds <- factor(rf_df2$preds, 
+                      level = rf_df2$preds[order(rf_df2$mean_decrease_in_accuracy, decreasing=TRUE)])
+
+class(rf_df2)
+
+
+# Plot
+#png(filename = here::here("results", "figs", "random-forest-var-imp-moe.png"), res = 300, width = 1, height = 6, units = "in")
+rf_var_imp_plot  <- ggplot(rf_df2, aes(x = preds, y = mean_decrease_in_accuracy)) +
+  geom_bar(stat = "identity") +
+  theme_bw() + 
+  labs(x = "Predictors (antigens)",
+       y = "Decrease in accuracy",
+       title = "") +         # Variable importance - Random forest
+  geom_errorbar(aes(ymin = mean_decrease_in_accuracy-sd,
+                    ymax = mean_decrease_in_accuracy+sd),
+                width = 0.2) + 
+  theme(axis.title = element_text(size=14), axis.text= element_text(size=12))
+#dev.off()
+rf_var_imp_plot 
+```
+
+
+
+
+#### Logistic regression
+
+Variable importance measure: size of coefficients. (This assumes that the variables were standardized prior to model fitting. If not, use coefficient*sd(data)). 
+
+
+```{r var-imp-log-regression}
+# Create data frame of estimates
+l_df <- data.frame(preds =names(log_no_cv$coefficients)[-1],
+                    coefficients = abs(log_no_cv$coefficients[-1]),
+                    se = sqrt(diag(vcov(log_no_cv)))[-1]) # standard error of the regression estimate 
+row.names(l_df) <- NULL
+
+
+# Update to rename "Omp" to "HP1564" as latter is more specific: 21/06/2022
+l_df$preds[which(l_df$preds=="Omp")] <- "HP1564"
+
+
+# Factor levels in decreasing order 
+l_df$preds <- factor(l_df$preds, 
+                      level = l_df$preds[order(l_df$coefficients, decreasing=TRUE)])
+
+
+# Plot 
+
+log_var_imp_plot <- ggplot(l_df, aes(x = preds, y = coefficients)) +
+  geom_bar(stat = "identity") +
+  theme_bw() + 
+  labs(x = "Predictors (antigens)",
+       y = "Absolute standardised \n coefficient",
+       title = "") +  #Variable importance - Logistic regression
+  geom_errorbar(aes(ymin = coefficients-se,
+                   ymax =  coefficients+se), # It doesn't make sense I think to plot the sds regression coefficients because they do not tell us about the variability of the regression coefficient estimate. They pnly say how spread apart the observed values are from the regression line. Right?  
+               width = 0.2) + 
+  theme(axis.title = element_text(size=14), axis.text= element_text(size=12)) 
+
+
+log_var_imp_plot
+
+# Export to csv 
+#write.csv(l_df, file = here::here("results", "logistic_regression_var_imp.csv"))
+```
+
+
+
+#### Combine these plots 
+
+Combine variable importance plots 
+
+```{r combine-plots}
+png(file = here::here("results", "figs", "variable-importance-plots-all-final.png"), res = 300, width = 10, height=8, units = "in")
+cowplot::plot_grid(bart_var_imp_plot_100, 
+                   rf_var_imp_plot,
+                   log_var_imp_plot,
+                   ncol=1,
+                   nrow = 3, 
+                   labels=LETTERS[1:3])
+dev.off()
+
+```
+
+
+Save importance measures data frame.
+
+```{r save-importance-measures, eval=F}
+
+imp_all <- list(BART = bm_df,
+                Random_forest = rf_df2[order(-rf_df2$mean_decrease_in_accuracy),],
+                Logistic_regression = l_df[order(-l_df$coefficients),])
+
+saveRDS(imp_all, file = here::here("results", "imp_all.RDS"))
+```
+
+
+#### Construct agreement plots 
+
+```{r agreement-plot}
+# Function for assigning rankings
+assign.rankings <- function(x){
+  x$rankings <- sort(rep(1:3, 4))
+  x
+}
+
+# Assign rankings
+df_rank <- lapply(imp_all, assign.rankings)
+
+# Construct agreement data frame with rankings by each data type
+
+agree_df <- cbind(df_rank$BART[, c("preds", "rankings")],
+      df_rank$Random_forest[, "rankings"][match(df_rank$BART$preds, df_rank$Random_forest$preds)],
+      df_rank$Logistic_regression[, "rankings"][match(df_rank$BART$preds, df_rank$Logistic_regression$preds)])
+
+names(agree_df)[-1] <- c("bart_rank",
+                         "rf_rank",
+                         "lr_rank")
+
+# Add columns indicating agreement with BART (baseline)
+
+
+agree_df$rf_agree_with_bart <- ifelse(agree_df$bart_rank == agree_df$rf_rank, 0, abs(agree_df$rf_rank - agree_df$bart_rank)) # If rankings are equal, 0. If not equal, compute the difference in rankings 
+agree_df$lr_agree_with_bart <- ifelse(agree_df$bart_rank == agree_df$lr_rank, 0, abs(agree_df$rf_rank - agree_df$bart_rank))
+
+
+# Data frame for plotting 
+new_df <- data.frame(preds = rep(agree_df$preds, 2),
+                     rank = c(agree_df$rf_agree_with_bart, agree_df$lr_agree_with_bart),
+                     method = c(rep("Random forest", length(agree_df$preds)), rep("Logistic regression",  length(agree_df$preds))))
+
+
+# Update to rename "Omp" to "HP1564" as latter is more specific: 21/06/2022
+# Result of reviews by Heidelberg multiplex serology group
+
+new_df$preds[which(new_df$preds=="Omp")] <- "HP1564"
+
+
+
+new_df$rank <- factor(format(new_df$rank), levels = format(sort(unique(new_df$rank))))
+
+# Save agreement data frame 
+save(agree_df, new_df, file = here::here("results", "agreement_data.rda"))
+```
+
+Agreement plot 
+
+```{r agreement-plot}
+
+# Plot
+png(file = here::here("results", "figs", "agreement-plot.png"), res = 300, width = 8, height=6, units = "in")
+ggplot(data = new_df, aes(x = method, y = preds, fill = rank)) +
+  geom_tile(color="grey", 
+            linewidth = 1, 
+            width = 0.7, 
+            height = 1.3) +
+  scale_x_discrete(position = 'top') +
+  labs(x = "Model", 
+       y = "Antigen",
+       fill = "Difference in ranking \n relative to BART") +
+  theme_bw() + 
+  viridis::scale_fill_viridis(discrete=TRUE) + 
+  theme(axis.title = element_text(size=14), 
+        axis.text= element_text(size=14),
+        legend.text = element_text(size=14),
+        legend.title = element_text(size=14))  +
+  scale_y_discrete(limits=rev) 
+dev.off()
+
+```
+
+
